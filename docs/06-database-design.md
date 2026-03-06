@@ -302,10 +302,89 @@ CREATE INDEX idx_refresh_log_created ON steering_refresh_log(created_at DESC);
 
 ---
 
+## Migration 003: Learning Loop Tables
+
+Added by the learning loop (see [09-learning-loop.md](09-learning-loop.md)).
+
+### Table: `gold_examples`
+
+Stores engineer-confirmed correct analyses used as dynamic few-shot examples in the LLM prompt.
+
+```sql
+CREATE TABLE gold_examples (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_id           UUID NOT NULL REFERENCES tickets(id),
+    analysis_result_id  UUID NOT NULL REFERENCES analysis_results(id),
+    functional_group    VARCHAR(50) NOT NULL,
+    example_summary     TEXT NOT NULL,        -- ~200-token compact analysis text
+    confirmation_count  INTEGER NOT NULL DEFAULT 1,
+    confirmed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_confirmed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    confirmed_by        UUID REFERENCES users(id),
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(ticket_id)   -- one gold example per ticket; repeated confirmations update it
+);
+
+CREATE INDEX idx_gold_fg        ON gold_examples(functional_group) WHERE is_active = TRUE;
+CREATE INDEX idx_gold_confirmed ON gold_examples(confirmation_count DESC, confirmed_at DESC);
+```
+
+### Table: `vector_accuracy_log`
+
+Nightly accuracy measurements per steering vector for drift detection.
+
+```sql
+CREATE TABLE vector_accuracy_log (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    vector_name     VARCHAR(100) NOT NULL,
+    measurement_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    period_days     INTEGER NOT NULL DEFAULT 7,
+    total_feedback  INTEGER NOT NULL,
+    correct_count   INTEGER NOT NULL,
+    incorrect_count INTEGER NOT NULL,
+    accuracy_rate   DECIMAL(5,4) NOT NULL,
+    baseline_rate   DECIMAL(5,4),
+    delta           DECIMAL(5,4),
+    drift_flagged   BOOLEAN NOT NULL DEFAULT FALSE,
+    notes           TEXT
+);
+
+CREATE INDEX idx_vaclog_vector ON vector_accuracy_log(vector_name, measurement_at DESC);
+CREATE INDEX idx_vaclog_drift  ON vector_accuracy_log(drift_flagged) WHERE drift_flagged = TRUE;
+```
+
+### New columns on existing tables
+
+```sql
+-- Track which vectors each feedback record updated (audit)
+ALTER TABLE analysis_feedback
+    ADD COLUMN vectors_updated TEXT[] DEFAULT '{}';
+
+-- Track accuracy delta across refreshes
+ALTER TABLE steering_refresh_log
+    ADD COLUMN pre_refresh_accuracy  DECIMAL(5,4),
+    ADD COLUMN post_refresh_accuracy DECIMAL(5,4),
+    ADD COLUMN triggered_by          VARCHAR(30) DEFAULT 'feedback_threshold';
+    -- triggered_by values: 'feedback_threshold' | 'manual' | 'drift_auto'
+```
+
+### Qdrant payload additions (tickets collection)
+
+These are added to the `tickets` Qdrant collection payload schema in `scripts/init_qdrant.py` — not PostgreSQL:
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `outcome_weight` | FLOAT | 1.0 | Retrieval score multiplier; incremented on `is_correct=true` feedback |
+| `confirmation_count` | INTEGER | 0 | Number of confirmed-correct feedback records for this ticket |
+| `last_confirmed_at` | DATETIME | null | Timestamp of most recent confirmation |
+
+---
+
 ## Redis Cache Keys
 
 | Key Pattern | Content | TTL |
-|-------------|---------|-----|
+| --- | --- | --- |
 | `embed:{model_ver}:{text_hash[:16]}` | 1024-dim float32 vector (bytes) | 7 days |
 | `analysis:{ticket_id}:v1` | Full `AnalysisResult` JSON | 24 hours |
 | `ticket:meta:{ticket_id}` | Full ticket dict JSON | 1 hour |

@@ -201,7 +201,7 @@ async def _fetch_pg_metadata(self, ticket_ids: list[str]) -> dict:
     return result
 ```
 
-After metadata join, a re-ranking step adds business rule adjustments:
+After metadata join, a re-ranking step adds business rule adjustments and an **outcome weight** from the learning loop:
 
 ```python
 def rerank_results(results: list[EnrichedTicket], query: SearchQuery) -> list[EnrichedTicket]:
@@ -220,10 +220,15 @@ def rerank_results(results: list[EnrichedTicket], query: SearchQuery) -> list[En
         if r.resolved_at and (datetime.utcnow() - r.resolved_at).days < 180:
             bonus += 0.02
 
-        r.final_score = min(r.similarity_score + bonus, 1.0)
+        # Outcome weight: confirmed-correct feedback increments this (1.0 default, 1.5 cap)
+        # See: docs/09-learning-loop.md — Learning Mechanism 2
+        outcome_weight = r.payload.get("outcome_weight", 1.0)
+        r.final_score = min((r.similarity_score * outcome_weight) + bonus, 1.0)
 
     return sorted(results, key=lambda x: x.final_score, reverse=True)
 ```
+
+`outcome_weight` comes from the Qdrant payload and is populated by the feedback service whenever an engineer confirms an analysis as correct. Tickets that have been repeatedly confirmed surface higher in re-ranking. See [09-learning-loop.md](09-learning-loop.md#learning-mechanism-2--outcome-weighted-retrieval) for the full algorithm.
 
 ---
 
@@ -283,6 +288,7 @@ POST /api/v1/tickets/search
                             ▼
 ┌───────────────────────────────────────────────┐
 │  Business Rule Re-Ranking                      │
+│  outcome_weight × similarity_score             │
 │  +0.05 exact group, +0.03 resolved, +0.02 recent │
 │  Sort by final_score DESC                     │
 └───────────────────────────┬───────────────────┘

@@ -272,18 +272,22 @@ with tracer.start_as_current_span("llm.analyze") as span:
 ```python
 # app/observability/metrics.py
 from prometheus_fastapi_instrumentator import Instrumentator
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, Gauge
 
 # HTTP metrics auto-collected by Instrumentator (latency, status codes, etc.)
 
 # Custom business metrics
-TICKETS_INGESTED    = Counter("tickets_ingested_total",       "Tickets ingested",       ["functional_group"])
-ANALYSES_COMPLETED  = Counter("analyses_completed_total",     "LLM analyses completed")
-EMBEDDING_LATENCY   = Histogram("embedding_latency_seconds",  "BGE embedding latency")
-BM25_CANDIDATES     = Histogram("retrieval_bm25_candidates",  "BM25 pre-filter count",  buckets=[5,10,20,30,50])
-LLM_CALLS           = Counter("llm_calls_total",              "OpenAI API calls",       ["model"])
-FEEDBACK_SUBMITTED  = Counter("feedback_submitted_total",     "Feedback records",       ["is_correct"])
-STEERING_REFRESHES  = Counter("steering_refreshes_total",     "Steering vector updates",["vector_name"])
+TICKETS_INGESTED    = Counter("tickets_ingested_total",         "Tickets ingested",              ["functional_group"])
+ANALYSES_COMPLETED  = Counter("analyses_completed_total",       "LLM analyses completed")
+EMBEDDING_LATENCY   = Histogram("embedding_latency_seconds",    "BGE embedding latency")
+BM25_CANDIDATES     = Histogram("retrieval_bm25_candidates",    "BM25 pre-filter count",         buckets=[5,10,20,30,50])
+LLM_CALLS           = Counter("llm_calls_total",                "OpenAI API calls",              ["model"])
+FEEDBACK_SUBMITTED  = Counter("feedback_submitted_total",       "Feedback records",              ["is_correct"])
+STEERING_REFRESHES  = Counter("steering_refreshes_total",       "Steering vector updates",       ["vector_name"])
+# Learning loop metrics (added in Phase 9)
+STEERING_DRIFT_ALERTS = Counter("steering_drift_alerts_total",  "Steering vector drift alerts",  ["vector_name"])
+VECTOR_ACCURACY     = Gauge("steering_vector_accuracy",         "7-day rolling feedback accuracy",["vector_name"])
+GOLD_EXAMPLES_COUNT = Gauge("gold_examples_total",              "Confirmed gold examples stored", ["functional_group"])
 
 def setup_metrics(app: FastAPI) -> None:
     Instrumentator().instrument(app).expose(app, endpoint="/metrics")
@@ -308,7 +312,7 @@ scrape_configs:
 Auto-provisioned at `http://localhost:3000` (admin/admin):
 
 | Panel | Metric |
-|-------|--------|
+| --- | --- |
 | Tickets Ingested/min | `rate(tickets_ingested_total[1m])` |
 | Analysis P95 Latency | `histogram_quantile(0.95, rate(http_request_duration_bucket{handler="/api/v1/analysis/similarity"}[5m]))` |
 | BM25 Candidate Count | `histogram_quantile(0.50, rate(retrieval_bm25_candidates_bucket[5m]))` |
@@ -316,6 +320,9 @@ Auto-provisioned at `http://localhost:3000` (admin/admin):
 | Feedback Rate | `rate(feedback_submitted_total[1m])` by `is_correct` |
 | Steering Refreshes | `increase(steering_refreshes_total[1d])` |
 | Embedding P99 Latency | `histogram_quantile(0.99, rate(embedding_latency_seconds_bucket[5m]))` |
+| **Vector Accuracy** | `steering_vector_accuracy` per `vector_name` (learning loop) |
+| **Drift Alerts** | `increase(steering_drift_alerts_total[24h]) > 0` (alert rule) |
+| **Gold Examples** | `gold_examples_total` per `functional_group` |
 
 ---
 
@@ -497,6 +504,19 @@ Return AnalysisResult JSON to caller
 | LLM reasoning | 300–2100ms | GPT-4o with 10-ticket context |
 | Store + return | 2100ms | PostgreSQL + Redis + response |
 | **Total** | **~2.1s** | **Full analysis** |
+
+---
+
+## Nightly Background Jobs
+
+Two scheduled tasks run inside the app process via `APScheduler` (or a container cron):
+
+| Job | Schedule | What It Does |
+| --- | --- | --- |
+| `drift_detection_job` | Daily, midnight | Measures 7-day feedback accuracy per steering vector; flags drift > 20%; auto-triggers refresh at > 35% regression. Writes to `vector_accuracy_log`. See [09-learning-loop.md](09-learning-loop.md#drift-detection). |
+| `outcome_weight_decay_job` | Daily, 01:00 | Reduces `outcome_weight` in Qdrant payload by 1%/30 days for tickets with no new confirmations, keeping old gold tickets from permanently dominating retrieval. |
+
+Both jobs are registered in `app/main.py` lifespan startup and share the existing database/Qdrant/Redis connections from `app/dependencies.py`.
 
 ---
 

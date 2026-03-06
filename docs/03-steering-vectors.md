@@ -276,44 +276,55 @@ Steering vectors are refreshed by two mechanisms:
 
 ### 1. Feedback-Triggered Refresh (Primary)
 
-Every time `POST /api/v1/analysis/{id}/feedback` is called, the unprocessed feedback count is checked. When it reaches the threshold (default: 50 records), a `BackgroundTask` runs `refresh_from_feedback()`.
+Every time `POST /api/v1/analysis/{id}/feedback` is called:
 
+1. Save the record to `analysis_feedback`
+2. **Immediately** invalidate the Redis analysis cache for the ticket (`DEL analysis:{ticket_id}:v1`) — a wrong answer must not be served to future callers
+3. Count `analysis_feedback WHERE used_for_training = FALSE`
+4. If count ≥ 50 → `BackgroundTask: refresh_from_feedback()`
+
+```text
+refresh_from_feedback() — exact algorithm:
+
+For each vector V in STEERING_VECTOR_CONFIG:
+
+  1. QUERY MATCHING FEEDBACK ROWS (via Attribution Table in 09-learning-loop.md)
+     SELECT af.*, t.description, t.analysis_notes, t.functional_group, t.status
+     FROM analysis_feedback af JOIN tickets t ON t.id = af.ticket_id
+     WHERE af.used_for_training = FALSE
+       AND <attribution rule for V>
+
+  2. CLASSIFY INTO POLES
+     positive_texts = []   # confirmed instances of target direction
+     negative_texts = []   # confirmed instances of opposite direction
+     (classification rules are per-vector — see Attribution Table)
+
+  3. FALLBACK PADDING
+     If len(positive_texts) < config["min_pairs"]:
+       pad from historical tickets (status Fixed/Rejected) to meet min_pairs
+
+  4. COMPUTE UPDATED VECTOR
+     pos_embs = bge_model.encode(positive_texts, normalize=True)
+     neg_embs = bge_model.encode(negative_texts, normalize=True)
+     sv = normalize(mean(pos_embs) - mean(neg_embs))
+
+  5. UPSERT TO QDRANT steering_vectors
+
+  6. INVALIDATE REDIS STEERING CACHE
+     DEL steering:v:{V}
+
+  7. MARK FEEDBACK CONSUMED
+     UPDATE analysis_feedback SET used_for_training=TRUE
+     WHERE ... (rows matched in step 1)
+
+  8. LOG TO steering_refresh_log (pair_count, feedback_count, triggered_by)
 ```
-Engineer submits feedback
-    │
-    ▼
-Save to analysis_feedback table
-    │
-    ▼
-COUNT WHERE used_for_training = FALSE
-    │
-    ├── count < 50 → done
-    │
-    └── count ≥ 50 → BackgroundTask: refresh_from_feedback()
-            │
-            ▼
-        Pull confirmed outcomes from DB
-            │
-            ▼
-        Build contrastive pairs (confirmed rejected vs confirmed fixed)
-            │
-            ▼
-        Re-embed pairs → compute mean(pos) - mean(neg) → normalize
-            │
-            ▼
-        Upsert to Qdrant steering_vectors
-            │
-            ▼
-        Invalidate Redis cache: DEL steering:v:{name}
-            │
-            ▼
-        Mark feedback rows: used_for_training = TRUE
-            │
-            ▼
-        Log to steering_refresh_log table
-```
+
+The full **Attribution Table** (which `feedback_type` + `corrected_value` updates which vector) is defined in [09-learning-loop.md](09-learning-loop.md#attribution-table).
 
 **Why threshold = 50?** Single feedback records are noisy. Batching 50 confirmed outcomes ensures statistical significance before updating the vector direction. The threshold is configurable via `FEEDBACK_REFRESH_THRESHOLD` in settings.
+
+**Third trigger — Drift Detection:** The nightly `drift_detection_job` can also trigger `refresh_from_feedback(triggered_by='drift_auto')` when a vector's 7-day accuracy drops by more than 35%. See [09-learning-loop.md](09-learning-loop.md#drift-detection).
 
 ### 2. Manual Refresh (On-demand)
 
@@ -337,4 +348,4 @@ Uses all available confirmed feedback + historical ticket data
 | Search latency overhead | baseline | +2ms | Negligible |
 | Memory overhead | baseline | +8 MB (8 vectors × 1024 × 4 bytes) | Negligible |
 
-> **Next:** [04-retrieval-pipeline.md](04-retrieval-pipeline.md)
+> **Next:** [04-retrieval-pipeline.md](04-retrieval-pipeline.md) | **Learning loop detail:** [09-learning-loop.md](09-learning-loop.md)

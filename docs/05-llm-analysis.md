@@ -4,10 +4,12 @@
 
 The LLM analysis module transforms retrieved ticket context into **structured, actionable intelligence**. It uses the top-10 retrieved tickets as grounding context and generates a JSON analysis covering duplicate detection, rejection prediction, root cause, and recommended action.
 
-The LLM never hallucinate — it reasons purely from retrieved evidence.
+The LLM never hallucinate — it reasons purely from retrieved evidence. Over time, the prompt is enriched with **gold examples** — engineer-confirmed correct analyses — that calibrate GPT-4o for each functional group without any fine-tuning (see [09-learning-loop.md](09-learning-loop.md#learning-mechanism-3--dynamic-few-shot-prompt-injection)).
 
-```
+```text
 New Ticket (unresolved)
+    +
+Top-3 Gold Examples (engineer-confirmed, same functional group — optional)
     +
 Top-10 Retrieved Tickets (two-stage BM25 + Qdrant)
     +
@@ -26,6 +28,8 @@ PostgreSQL (analysis_results table) + Redis cache (24h TTL)
 ---
 
 ## Prompt Template
+
+The template includes an optional `{gold_examples_block}` section injected between the role block and the retrieved tickets. It is omitted when `gold_count == 0`.
 
 ```python
 # app/modules/llm/prompts.py
@@ -56,6 +60,7 @@ retrieved from the knowledge base.
 **Analysis Notes:**
 {analysis_notes}
 
+{gold_examples_block}
 ---
 
 ## RETRIEVED SIMILAR HISTORICAL TICKETS
@@ -154,6 +159,25 @@ def format_context_tickets(retrieved_tickets: list[EnrichedTicket]) -> str:
         blocks.append(block.strip())
 
     return "\n\n---\n\n".join(blocks)
+
+
+def format_gold_examples(gold_shots: list) -> str:
+    """
+    Render confirmed-correct analyses as a few-shot block.
+    Returns empty string if no gold examples — the template handles omission.
+    """
+    if not gold_shots:
+        return ""
+
+    header = (
+        "## CONFIRMED ANALYSIS EXAMPLES (engineer-validated for this functional group)\n\n"
+        "The following examples were confirmed correct by engineers. "
+        "Use them as calibration references — your analysis should be consistent "
+        "with these validated patterns.\n"
+    )
+    blocks = [f"### Validated Example {i+1}\n{ex.example_summary}"
+              for i, ex in enumerate(gold_shots)]
+    return header + "\n\n".join(blocks) + "\n\n---\n\n"
 ```
 
 ---
@@ -174,7 +198,8 @@ class LLMService:
     async def analyze_ticket(
         self,
         query_ticket: TicketInput,
-        context_tickets: list[EnrichedTicket]
+        context_tickets: list[EnrichedTicket],
+        gold_shots: list = []        # confirmed-correct examples for this functional group
     ) -> AnalysisResult:
 
         # Cache check (24h TTL — analyses don't change for same ticket)
@@ -182,8 +207,9 @@ class LLMService:
         if cached := await self.redis.get(cache_key):
             return AnalysisResult.model_validate_json(cached)
 
-        # Format prompt
+        # Format prompt — gold_examples_block is empty string when no gold shots exist
         context_str = format_context_tickets(context_tickets)
+        gold_block   = format_gold_examples(gold_shots)
         prompt = ANALYSIS_PROMPT_TEMPLATE.format(
             ticket_id=query_ticket.ticket_id,
             functional_group=query_ticket.functional_group,
@@ -193,6 +219,7 @@ class LLMService:
             analysis_notes=query_ticket.analysis_notes or "Not provided",
             context_count=len(context_tickets),
             context_tickets=context_str,
+            gold_examples_block=gold_block,   # empty string omits the section
         )
 
         # Call GPT-4o with JSON mode
@@ -244,9 +271,15 @@ class AnalysisService:
         )
         search_resp = await retrieval_svc.search(search_req)
 
-        # LLM analysis with retrieved context
+        # Fetch gold examples for this functional group (learning loop — Layer 3 memory)
+        gold_shots = await gold_examples_svc.fetch_for_group(
+            functional_group=ticket_input.functional_group,
+            limit=3
+        )
+
+        # LLM analysis with retrieved context + gold few-shots
         context_tickets = self._search_results_to_enriched(search_resp.results)
-        result = await llm_svc.analyze_ticket(ticket_input, context_tickets)
+        result = await llm_svc.analyze_ticket(ticket_input, context_tickets, gold_shots)
 
         # Persist to analysis_results table
         await self._save_analysis(result, ticket_orm.id, search_resp.steering_applied, db)
