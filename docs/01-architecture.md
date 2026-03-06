@@ -2,26 +2,23 @@
 
 ## Overview
 
-The Ticket Intelligence System is a **modular monolith** — a single FastAPI application with independent internal modules. This replaces the original 8-microservice design.
+The Ticket Intelligence System is a **modular monolith** — a single FastAPI application organised into independent internal modules, each owning one responsibility.
 
-**Why modular monolith over microservices?**
+**Architecture principles:**
 
-| Factor | Microservices (Original) | Modular Monolith (Current) |
-|--------|--------------------------|---------------------------|
-| Deployment | 8 containers to manage | 1 app container |
-| Embedding model | Loaded once per embedding service | Loaded once in-process |
-| Inter-module calls | HTTP (network overhead, retry logic) | Direct Python function calls |
-| Debugging | Distributed traces required | Single log stream |
-| Scaling path | Already separated | Extract modules to services under real load |
-| Dev setup | 8 Dockerfiles, complex compose | 1 Dockerfile |
-
-The module boundaries are identical to the original service boundaries — the system can be split into microservices later if scaling demands it.
+| Principle | Decision |
+| --- | --- |
+| **Single deployable unit** | One application container; no inter-service HTTP overhead |
+| **Module isolation** | Each module has its own router, service, and models — no cross-module shared state |
+| **In-process communication** | Modules call each other as Python functions; no network hops |
+| **Background for slow work** | Embedding and steering refresh run as `BackgroundTasks` after the HTTP response is returned |
+| **Scale-out path** | Any module can be extracted into a standalone service if load demands it — the boundaries are already clean |
 
 ---
 
 ## Architecture Diagram
 
-```
+```text
 ┌────────────────────────────────────────────────────────────────┐
 │                      EXTERNAL CLIENTS                          │
 │   Jira Webhook │ Custom Backend │ Frontend Dashboard           │
@@ -35,15 +32,15 @@ The module boundaries are identical to the original service boundaries — the s
 ┌───────────────────────────▼────────────────────────────────────┐
 │              FASTAPI APP  (:8000, single process)              │
 │                                                                │
-│  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  ┌─────────┐  │
-│  │  ingestion  │  │  retrieval  │  │ analysis  │  │ webhook │  │
-│  │  module     │  │  module     │  │  module   │  │ module  │  │
-│  └──────┬──────┘  └──────┬──────┘  └─────┬─────┘  └────┬────┘  │
+│  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  ┌─────────┐ │
+│  │  ingestion  │  │  retrieval  │  │ analysis  │  │ webhook │ │
+│  │  module     │  │  module     │  │  module   │  │ module  │ │
+│  └──────┬──────┘  └──────┬──────┘  └─────┬─────┘  └────┬────┘ │
 │         │                │               │              │      │
-│  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼─────┐  ┌────▼────┐  │
-│  │  embedding  │  │  steering   │  │    llm    │  │feedback │  │
-│  │  module     │  │  module     │  │  module   │  │ module  │  │
-│  └─────────────┘  └─────────────┘  └───────────┘  └─────────┘  │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼─────┐  ┌────▼────┐ │
+│  │  embedding  │  │  steering   │  │    llm    │  │feedback │ │
+│  │  module     │  │  module     │  │  module   │  │ module  │ │
+│  └─────────────┘  └─────────────┘  └───────────┘  └─────────┘ │
 │                                                                │
 │  app/observability/ ── OTel tracing + Prometheus metrics       │
 │  shared/ ──────────── database, qdrant, cache, auth, models    │
@@ -65,7 +62,7 @@ The module boundaries are identical to the original service boundaries — the s
 ## Module Responsibilities
 
 | Module | Path | Responsibility |
-|--------|------|---------------|
+| --- | --- | --- |
 | `ingestion` | `app/modules/ingestion/` | Accept tickets via REST, dedup by SHA-256 hash, queue background embed |
 | `embedding` | `app/modules/embedding/` | BGE-large-en-v1.5 inference, format ticket text, upsert to Qdrant |
 | `retrieval` | `app/modules/retrieval/` | Two-stage: PostgreSQL BM25 pre-filter (top-50) → Qdrant ANN rerank (top-10) |
@@ -79,7 +76,7 @@ The module boundaries are identical to the original service boundaries — the s
 
 ## Communication Patterns
 
-```
+```text
 SYNC (HTTP):
   Client → Nginx → FastAPI → module router → module service → Response
 
@@ -98,7 +95,7 @@ INTERNAL (direct Python calls, no HTTP):
 
 ## Folder Structure
 
-```
+```text
 rag-ticket-ananlysis/
 │
 ├── app/
@@ -196,13 +193,13 @@ rag-ticket-ananlysis/
 ## Key Design Principles
 
 | Principle | Implementation |
-|-----------|---------------|
-| **Modular, not micro** | Independent modules in one process; extract to services under proven load |
+| --- | --- |
 | **Async by default** | FastAPI async/await, asyncpg, aioredis throughout |
 | **Background for slow work** | Embedding (~100ms) and steering refresh use `BackgroundTasks` |
 | **Config as code** | All settings via environment variables (12-factor) |
 | **Migration-first** | All DB changes via Alembic migrations — never direct SQL edits |
 | **Shared models once** | `shared/models/ticket.py` is the single source of truth for all Pydantic types |
+| **Observable by default** | Every request traced via OTel; business metrics exported to Prometheus |
 
 ---
 
@@ -211,7 +208,7 @@ rag-ticket-ananlysis/
 ### Development (docker-compose)
 
 | Component | CPU | RAM | Notes |
-|-----------|-----|-----|-------|
+| --- | --- | --- | --- |
 | App (FastAPI + BGE model) | 2 cores | 10 GB | BGE-large ~4 GB; rest for app |
 | Qdrant | 2 cores | 8 GB | Scales with collection size |
 | PostgreSQL | 1 core | 2 GB | |
@@ -219,11 +216,12 @@ rag-ticket-ananlysis/
 | Prometheus + Grafana + OTel | 1 core | 1 GB | |
 | **Total** | **~7 cores** | **~22 GB** | Single machine feasible |
 
-### Production (scale-out path)
+### Scale-Out Path
 
-When volume demands it, extract these modules first (in order):
-1. `embedding` — GPU nodes; most resource-intensive
-2. `retrieval` — I/O bound; easy to scale horizontally
-3. `llm` — stateless; scales with LLM API quota
+When load demands it, extract these modules first (in order):
+
+1. `embedding` — most resource-intensive; move to GPU nodes
+2. `retrieval` — I/O bound; horizontal scaling is straightforward
+3. `llm` — stateless HTTP calls; scales with OpenAI API quota
 
 > **Next:** [02-data-layer.md](02-data-layer.md)
